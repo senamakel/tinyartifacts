@@ -5,6 +5,7 @@ use std::path::{Component, Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use tinystoragedrivers_core::{BlobStore as TsdBlobStore, ScopedStorage};
+use tokio::io::AsyncWriteExt;
 
 use crate::file_ref::{FileRef, FileRoots};
 /// Storage-independent metadata returned when bytes are written.
@@ -124,6 +125,81 @@ impl FsFileStore {
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Replace the bytes of an existing regular file below the store root.
+    ///
+    /// The file is opened and truncated in place, preserving its inode and
+    /// filesystem metadata such as permissions. The write is not atomic: an
+    /// I/O error can leave the target partially written. The root, parent
+    /// directories, and target must already exist. A final symlink is allowed
+    /// only when it resolves to a regular file inside the root.
+    ///
+    /// Unlike [`FileStore::put`], this operation does not create or atomically
+    /// replace a target. It is intended for callers that must respect the
+    /// operating system's write permission for an already existing file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the key is invalid, the root or target is
+    /// missing, the target is not a regular file, it escapes the root, or the
+    /// target cannot be opened or written.
+    pub async fn overwrite_existing(
+        &self,
+        key: &str,
+        bytes: &[u8],
+        media_type: Option<&str>,
+    ) -> Result<FileMetadata> {
+        let path = self.existing_path(key).await?;
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .await
+            .with_context(|| format!("cannot open {} for writing", path.display()))?;
+        file.write_all(bytes)
+            .await
+            .with_context(|| format!("cannot write {}", path.display()))?;
+        file.flush()
+            .await
+            .with_context(|| format!("cannot flush {}", path.display()))?;
+
+        Ok(FileMetadata {
+            size_bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            media_type: media_type
+                .map(str::to_owned)
+                .or_else(|| crate::media_type_for(Path::new(key)).map(str::to_owned)),
+        })
+    }
+
+    async fn existing_path(&self, key: &str) -> Result<PathBuf> {
+        validate_key(key)?;
+        let root = tokio::fs::canonicalize(&self.root)
+            .await
+            .with_context(|| format!("cannot resolve file store root {}", self.root.display()))?;
+        let path = root.join(key);
+        let parent = path.parent().context("file key has no parent")?;
+        let canonical_parent = tokio::fs::canonicalize(parent)
+            .await
+            .with_context(|| format!("cannot resolve parent of {}", path.display()))?;
+        if !canonical_parent.starts_with(&root) {
+            bail!("file key escapes the configured store root: {key:?}");
+        }
+
+        let candidate = canonical_parent.join(path.file_name().context("file key has no name")?);
+        let canonical = tokio::fs::canonicalize(&candidate)
+            .await
+            .with_context(|| format!("cannot resolve existing file {}", candidate.display()))?;
+        if !canonical.starts_with(&root) {
+            bail!("file key escapes the configured store root: {key:?}");
+        }
+        let metadata = tokio::fs::metadata(&canonical)
+            .await
+            .with_context(|| format!("cannot inspect {}", canonical.display()))?;
+        if !metadata.is_file() {
+            bail!("file key does not name a regular file: {key:?}");
+        }
+        Ok(canonical)
     }
 
     async fn path(&self, key: &str, create_parent: bool) -> Result<PathBuf> {
