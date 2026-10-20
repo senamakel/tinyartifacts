@@ -35,6 +35,132 @@ async fn filesystem_store_reads_metadata_and_deletes_by_artifact_prefix() {
 }
 
 #[tokio::test]
+async fn overwrite_existing_preserves_the_file_and_replaces_its_bytes() {
+    let root = temp_dir();
+    let path = root.join("existing.txt");
+    std::fs::write(&path, b"before").unwrap();
+    let store = FsFileStore::new(&root);
+
+    #[cfg(unix)]
+    let before = {
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let metadata = std::fs::metadata(&path).unwrap();
+        (metadata.dev(), metadata.ino(), metadata.mode())
+    };
+
+    let metadata = store
+        .overwrite_existing("existing.txt", b"after", None)
+        .await
+        .unwrap();
+
+    assert_eq!(std::fs::read(&path).unwrap(), b"after");
+    assert_eq!(metadata.size_bytes, 5);
+    assert_eq!(metadata.media_type.as_deref(), Some("text/plain"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let after = std::fs::metadata(&path).unwrap();
+        assert_eq!((after.dev(), after.ino(), after.mode()), before);
+    }
+}
+
+#[tokio::test]
+async fn overwrite_existing_refuses_missing_targets_without_creating_paths() {
+    let root = temp_dir();
+    let store = FsFileStore::new(&root);
+
+    assert!(store
+        .overwrite_existing("missing.txt", b"bytes", None)
+        .await
+        .is_err());
+    assert!(store
+        .overwrite_existing("missing/child.txt", b"bytes", None)
+        .await
+        .is_err());
+    assert!(!root.join("missing").exists());
+    assert!(!root.join("missing.txt").exists());
+
+    let missing_root = root.join("missing-root");
+    assert!(FsFileStore::new(&missing_root)
+        .overwrite_existing("file.txt", b"bytes", None)
+        .await
+        .is_err());
+    assert!(!missing_root.exists());
+}
+
+#[tokio::test]
+async fn overwrite_existing_rejects_non_files_and_symlinks_outside_the_root() {
+    let root = temp_dir();
+    let store = FsFileStore::new(&root);
+    std::fs::create_dir(root.join("directory")).unwrap();
+    assert!(store
+        .overwrite_existing("directory", b"bytes", None)
+        .await
+        .is_err());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+        let outside = temp_dir().join("outside.txt");
+        std::fs::write(&outside, b"keep").unwrap();
+        symlink(&outside, root.join("outside-link.txt")).unwrap();
+
+        assert!(store
+            .overwrite_existing("outside-link.txt", b"replace", None)
+            .await
+            .is_err());
+        assert_eq!(std::fs::read(outside).unwrap(), b"keep");
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn overwrite_existing_follows_symlinks_that_resolve_inside_the_root() {
+    use std::os::unix::fs::symlink;
+    use std::os::unix::fs::MetadataExt;
+    let root = temp_dir();
+    let path = root.join("target.txt");
+    std::fs::write(&path, b"before").unwrap();
+    symlink(&path, root.join("link.txt")).unwrap();
+    let inode = std::fs::metadata(&path).unwrap().ino();
+
+    FsFileStore::new(&root)
+        .overwrite_existing("link.txt", b"after", None)
+        .await
+        .unwrap();
+
+    let metadata = std::fs::metadata(&path).unwrap();
+    assert_eq!(metadata.ino(), inode);
+    assert_eq!(std::fs::read(path).unwrap(), b"after");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn overwrite_existing_obeys_filesystem_write_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = temp_dir();
+    let path = root.join("read-only.txt");
+    std::fs::write(&path, b"preserve").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+    let write_is_allowed = std::fs::OpenOptions::new().write(true).open(&path).is_ok();
+    let result = FsFileStore::new(&root)
+        .overwrite_existing("read-only.txt", b"replace", None)
+        .await;
+
+    if write_is_allowed {
+        result.unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"replace");
+    } else {
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"preserve");
+    }
+}
+
+#[tokio::test]
 async fn blob_adapters_share_objects_across_instances() {
     let backend = MemoryStorage::new();
     let scope = Scope::local();
