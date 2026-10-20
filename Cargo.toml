@@ -19,7 +19,7 @@ anyhow = "1"
 uuid = { version = "1", features = ["v4"] }
 tokio = { version = "1", features = ["fs"] }
 tracing = "0.1"
-tinytools = { git = "https://github.com/tinyhumansai/tinytools.git", version = "0.5" }
+tinytools = { git = "https://github.com/tinyhumansai/tinytools.git", rev = "1ec3468f6602b69b955a0e94105ed63abb5aa98c", version = "0.6" }
 # Blob-backed file versions use the same scoped port every OpenHuman module uses.
 tinystoragedrivers-core = { version = "1.0", git = "https://github.com/tinyhumansai/tinystoragedrivers.git", rev = "be94f7568fe7650b0729be55128f48270414b9a7" }
 

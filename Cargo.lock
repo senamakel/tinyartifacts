@@ -429,8 +429,8 @@ dependencies = [
 
 [[package]]
 name = "tinytools"
-version = "0.5.0"
-source = "git+https://github.com/tinyhumansai/tinytools.git#18720afd96f558c188ba0864aabb3d71001b9e77"
+version = "0.6.0"
+source = "git+https://github.com/tinyhumansai/tinytools.git?rev=1ec3468f6602b69b955a0e94105ed63abb5aa98c#1ec3468f6602b69b955a0e94105ed63abb5aa98c"
 dependencies = [
  "anyhow",
  "async-trait",
