@@ -4,8 +4,8 @@
 
 - Back artifact records with the host-bound document port and apply
   artifact-owned migrations on open.
-- Adapt file bytes through the host-bound blob port; remove filesystem stores
-  so the library does not own host paths or persistence engines.
+- Adapt file bytes through the host-bound blob port, and restore `FsFileStore`
+  for callers that explicitly manage a local filesystem root.
 - Accept serialized legacy record bytes for host-managed imports.
 
 ## 0.2.0

@@ -83,7 +83,7 @@ The service enforces the rules, whoever is calling:
 | `ArtifactStore` | Where records are kept. `DocumentArtifactStore` adapts the host-bound document port and applies the artifact-owned schema migration on open. |
 | `ArtifactObserver` | Told after every write (`pending`, `ready`, `failed`, `deleted`) — show a card, copy the file where the user can open it. If it fails, the write stands and the caller gets a notice. |
 | `ArtifactPublisher` | How a version is shared (e.g. an upload and a link). Optional. |
-| `FileStore` | Durable file bytes behind `FileRef` keys. Implement it for a host's blob backend, or use `BlobFileStore` to adapt the `BlobStore` port. |
+| `FileStore` | Durable file bytes behind `FileRef` keys. Use `BlobFileStore` to adapt a host's `BlobStore`, or `FsFileStore` to keep files beneath a local root. |
 | `FileRoots` | Allowed input folders. Paths are canonicalized and checked before a file store reads them; `with_guard` can refuse paths inside them (credential stores, its own data). |
 
 Hosts provide an already-bound `tinystoragedrivers_api::Storage` bundle. The
@@ -93,6 +93,14 @@ that imports old filesystem records can pass each record's serialized bytes to
 `import_legacy_record_json`; locating source files and copying legacy file
 bytes remain host responsibilities. Legacy `FileRef.path` values still
 deserialize so host import code can resolve them with its existing policy.
+
+`FsFileStore` creates its root and parent directories as needed and rejects
+keys that escape that root, including symlink targets outside it. Its ordinary
+`put` writes a staging file before replacing the destination. The separate
+`overwrite_existing` method updates an existing file in place, preserving its
+inode and permissions; it is not atomic and can leave partial bytes after an
+I/O failure. Use `BlobFileStore` when file bytes must live in the host's
+bound storage backend.
 
 ## Agent tools
 

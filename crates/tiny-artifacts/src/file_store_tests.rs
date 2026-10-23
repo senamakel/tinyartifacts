@@ -17,7 +17,26 @@ fn a_failed_staging_write_removes_its_partial_file() {
     let result = write_staging_file(&directory, ".partial.tmp", |file| {
         file.write_all(b"partial")?;
         Err(std::io::Error::other("injected write failure"))
-    });
+    }, |file| file.sync_all());
+
+    assert!(result.is_err());
+    assert!(!root.join(".partial.tmp").exists());
+}
+
+#[test]
+fn a_failed_staging_sync_removes_its_complete_file() {
+    use cap_std::ambient_authority;
+    use cap_std::fs::Dir;
+    use std::io::Write;
+
+    let root = temp_dir();
+    let directory = Dir::open_ambient_dir(&root, ambient_authority()).unwrap();
+    let result = write_staging_file(
+        &directory,
+        ".partial.tmp",
+        |file| file.write_all(b"complete"),
+        |_| Err(std::io::Error::other("injected sync failure")),
+    );
 
     assert!(result.is_err());
     assert!(!root.join(".partial.tmp").exists());

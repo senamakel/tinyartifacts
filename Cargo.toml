@@ -17,8 +17,9 @@ async-trait = "0.1"
 thiserror = "2"
 anyhow = "1"
 uuid = { version = "1", features = ["v4"] }
-tokio = { version = "1", features = ["fs", "io-util", "rt"] }
+# Capability-based filesystem operations keep `FsFileStore` keys under its root.
 cap-std = "4"
+tokio = { version = "1", features = ["fs", "rt"] }
 tracing = "0.1"
 tinytools = { git = "https://github.com/tinyhumansai/tinytools.git", rev = "3a01641", version = "0.6" }
 # Artifact records and file bytes use the host-bound stable storage ports.

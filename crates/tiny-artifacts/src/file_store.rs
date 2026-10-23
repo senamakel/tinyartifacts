@@ -1,4 +1,4 @@
-//! Durable artifact bytes over a host-bound blob handle.
+//! Durable artifact bytes over host-bound blob storage or a rooted filesystem.
 
 use std::path::{Component, Path, PathBuf};
 
@@ -267,8 +267,13 @@ impl FileStore for FsFileStore {
                 .with_context(|| format!("cannot open parent directory for {key}"))?;
             let file_name = relative.file_name().context("file key has no name")?;
             let staging = format!(".{}.tmp", uuid::Uuid::new_v4());
-            write_staging_file(&directory, &staging, |file| file.write_all(&bytes))
-                .with_context(|| format!("cannot write staging file for {key}"))?;
+            write_staging_file(
+                &directory,
+                &staging,
+                |file| file.write_all(&bytes),
+                |file| file.sync_all(),
+            )
+            .with_context(|| format!("cannot write staging file for {key}"))?;
             if let Err(error) = directory.rename(&staging, &directory, file_name) {
                 let _ = directory.remove_file(&staging);
                 return Err(error).with_context(|| format!("cannot save {key}"));
@@ -295,9 +300,15 @@ impl FileStore for FsFileStore {
             use cap_std::ambient_authority;
             use cap_std::fs::Dir;
 
-            let root_path = std::fs::canonicalize(&root_path).with_context(|| {
-                format!("cannot resolve file store root {}", root_path.display())
-            })?;
+            let root_path = match std::fs::canonicalize(&root_path) {
+                Ok(path) => path,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("cannot resolve file store root {}", root_path.display())
+                    });
+                }
+            };
             let root = Dir::open_ambient_dir(&root_path, ambient_authority())
                 .with_context(|| format!("cannot open file store root {}", root_path.display()))?;
             let relative = match canonical_relative_target(&root_path, &key) {
@@ -340,15 +351,15 @@ impl FileStore for FsFileStore {
             };
             let root = Dir::open_ambient_dir(&root_path, ambient_authority())
                 .with_context(|| format!("cannot open file store root {}", root_path.display()))?;
-            if let Err(error) = canonical_relative_target(&root_path, &relative) {
-                if error
+            let relative = match canonical_relative_target(&root_path, &relative) {
+                Ok(relative) => relative,
+                Err(error)
+                    if error
                     .downcast_ref::<std::io::Error>()
                     .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
-                {
-                    return Ok(());
-                }
-                return Err(error);
-            }
+                => return Ok(()),
+                Err(error) => return Err(error),
+            };
             match root.remove_dir_all(&relative) {
                 Ok(()) => Ok(()),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -412,9 +423,15 @@ fn create_parent_directory(
     Ok(directory)
 }
 
-fn write_staging_file<F>(directory: &cap_std::fs::Dir, staging: &str, write_body: F) -> Result<()>
+fn write_staging_file<F, S>(
+    directory: &cap_std::fs::Dir,
+    staging: &str,
+    write_body: F,
+    sync_file: S,
+) -> Result<()>
 where
     F: FnOnce(&mut cap_std::fs::File) -> std::io::Result<()>,
+    S: FnOnce(&mut cap_std::fs::File) -> std::io::Result<()>,
 {
     use cap_std::fs::OpenOptions;
 
@@ -426,7 +443,7 @@ where
         let _ = directory.remove_file(staging);
         return Err(error).with_context(|| format!("cannot write staging file {staging}"));
     }
-    if let Err(error) = file.sync_all() {
+    if let Err(error) = sync_file(&mut file) {
         drop(file);
         let _ = directory.remove_file(staging);
         return Err(error).with_context(|| format!("cannot sync staging file {staging}"));
