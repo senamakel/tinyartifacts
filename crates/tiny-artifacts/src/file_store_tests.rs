@@ -6,6 +6,23 @@ fn temp_dir() -> PathBuf {
     path
 }
 
+#[test]
+fn a_failed_staging_write_removes_its_partial_file() {
+    use cap_std::ambient_authority;
+    use cap_std::fs::Dir;
+    use std::io::Write;
+
+    let root = temp_dir();
+    let directory = Dir::open_ambient_dir(&root, ambient_authority()).unwrap();
+    let result = write_staging_file(&directory, ".partial.tmp", |file| {
+        file.write_all(b"partial")?;
+        Err(std::io::Error::other("injected write failure"))
+    });
+
+    assert!(result.is_err());
+    assert!(!root.join(".partial.tmp").exists());
+}
+
 use tinystoragedrivers_api::Storage;
 use tinystoragedrivers_testkit::memory_storage;
 use tinystoragedrivers_types::Scope;
@@ -150,6 +167,62 @@ async fn overwrite_existing_follows_symlinks_that_resolve_inside_the_root() {
     let metadata = std::fs::metadata(&path).unwrap();
     assert_eq!(metadata.ino(), inode);
     assert_eq!(std::fs::read(path).unwrap(), b"after");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn overwrite_existing_does_not_follow_a_parent_replaced_with_an_external_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let root = temp_dir();
+    let parent = root.join("parent");
+    std::fs::create_dir(&parent).unwrap();
+    std::fs::write(parent.join("target.txt"), b"inside").unwrap();
+    let outside = temp_dir();
+    std::fs::write(outside.join("target.txt"), b"outside").unwrap();
+    let store = FsFileStore::new(&root);
+    let moved_parent = root.join("parent-moved");
+    let hook_parent = parent.clone();
+    let hook_outside = outside.clone();
+
+    let result = store
+        .overwrite_existing_with_hook("parent/target.txt", b"changed", None, move || {
+            std::fs::rename(&hook_parent, moved_parent).unwrap();
+            symlink(hook_outside, hook_parent).unwrap();
+        })
+        .await;
+
+    assert!(result.is_err(), "the parent swap must invalidate the open");
+    assert_eq!(
+        std::fs::read(outside.join("target.txt")).unwrap(),
+        b"outside"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn read_does_not_follow_a_parent_replaced_with_an_external_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let root = temp_dir();
+    let parent = root.join("parent");
+    std::fs::create_dir(&parent).unwrap();
+    std::fs::write(parent.join("target.txt"), b"inside").unwrap();
+    let outside = temp_dir();
+    std::fs::write(outside.join("target.txt"), b"outside").unwrap();
+    let store = FsFileStore::new(&root);
+    let moved_parent = root.join("parent-moved");
+    let hook_parent = parent.clone();
+    let hook_outside = outside.clone();
+
+    let result = store
+        .read_with_hook("parent/target.txt", move || {
+            std::fs::rename(&hook_parent, moved_parent).unwrap();
+            symlink(hook_outside, hook_parent).unwrap();
+        })
+        .await;
+
+    assert!(result.is_err(), "the parent swap must invalidate the read");
 }
 
 #[cfg(unix)]

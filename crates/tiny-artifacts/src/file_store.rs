@@ -5,7 +5,6 @@ use std::path::{Component, Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use tinystoragedrivers_api::{BlobStore as TsdBlobStore, Storage};
-use tokio::io::AsyncWriteExt;
 
 /// Storage-independent metadata returned when bytes are written.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -146,198 +145,293 @@ impl FsFileStore {
         bytes: &[u8],
         media_type: Option<&str>,
     ) -> Result<FileMetadata> {
-        let path = self.existing_path(key).await?;
-        let mut file = tokio::fs::OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open(&path)
+        self.overwrite_existing_with_hook(key, bytes, media_type, || {})
             .await
-            .with_context(|| format!("cannot open {} for writing", path.display()))?;
-        file.write_all(bytes)
-            .await
-            .with_context(|| format!("cannot write {}", path.display()))?;
-        file.flush()
-            .await
-            .with_context(|| format!("cannot flush {}", path.display()))?;
+    }
 
-        Ok(FileMetadata {
-            size_bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
-            media_type: media_type
-                .map(str::to_owned)
-                .or_else(|| crate::media_type_for(Path::new(key)).map(str::to_owned)),
+    async fn overwrite_existing_with_hook<F>(
+        &self,
+        key: &str,
+        bytes: &[u8],
+        media_type: Option<&str>,
+        before_open: F,
+    ) -> Result<FileMetadata>
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        validate_key(key)?;
+        let root_path = self.root.clone();
+        let key = key.to_owned();
+        let bytes = bytes.to_vec();
+        let media_type = media_type.map(str::to_owned);
+        let file = tokio::task::spawn_blocking(move || -> Result<FileMetadata> {
+            use cap_std::ambient_authority;
+            use cap_std::fs::{Dir, OpenOptions};
+            use std::io::Write;
+
+            let root_path = std::fs::canonicalize(&root_path).with_context(|| {
+                format!("cannot resolve file store root {}", root_path.display())
+            })?;
+            let root = Dir::open_ambient_dir(&root_path, ambient_authority())
+                .with_context(|| format!("cannot open file store root {}", root_path.display()))?;
+            let relative = canonical_relative_target(&root_path, &key)
+                .with_context(|| format!("cannot resolve existing file {key}"))?;
+            let metadata = root
+                .metadata(&relative)
+                .with_context(|| format!("cannot resolve existing file {key}"))?;
+            if !metadata.is_file() {
+                bail!("file key does not name a regular file: {key:?}");
+            }
+            before_open();
+            let mut options = OpenOptions::new();
+            options.write(true).truncate(true);
+            let mut file = root
+                .open_with(&relative, &options)
+                .with_context(|| format!("cannot open {key} for writing"))?;
+            file.write_all(&bytes)
+                .with_context(|| format!("cannot write {key}"))?;
+            file.flush()
+                .with_context(|| format!("cannot flush {key}"))?;
+
+            Ok(FileMetadata {
+                size_bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+                media_type: media_type
+                    .or_else(|| crate::media_type_for(Path::new(&key)).map(str::to_owned)),
+            })
         })
+        .await
+        .context("file-store overwrite task failed")??;
+        Ok(file)
     }
 
-    async fn existing_path(&self, key: &str) -> Result<PathBuf> {
+    async fn read_with_hook<F>(&self, key: &str, before_open: F) -> Result<Vec<u8>>
+    where
+        F: FnOnce() + Send + 'static,
+    {
         validate_key(key)?;
-        let root = tokio::fs::canonicalize(&self.root)
-            .await
-            .with_context(|| format!("cannot resolve file store root {}", self.root.display()))?;
-        let path = root.join(key);
-        let parent = path.parent().context("file key has no parent")?;
-        let canonical_parent = tokio::fs::canonicalize(parent)
-            .await
-            .with_context(|| format!("cannot resolve parent of {}", path.display()))?;
-        if !canonical_parent.starts_with(&root) {
-            bail!("file key escapes the configured store root: {key:?}");
-        }
+        let root_path = self.root.clone();
+        let key = key.to_owned();
+        tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
+            use cap_std::ambient_authority;
+            use cap_std::fs::Dir;
+            use std::io::Read;
 
-        let candidate = canonical_parent.join(path.file_name().context("file key has no name")?);
-        let canonical = tokio::fs::canonicalize(&candidate)
-            .await
-            .with_context(|| format!("cannot resolve existing file {}", candidate.display()))?;
-        if !canonical.starts_with(&root) {
-            bail!("file key escapes the configured store root: {key:?}");
-        }
-        let metadata = tokio::fs::metadata(&canonical)
-            .await
-            .with_context(|| format!("cannot inspect {}", canonical.display()))?;
-        if !metadata.is_file() {
-            bail!("file key does not name a regular file: {key:?}");
-        }
-        Ok(canonical)
+            let root_path = std::fs::canonicalize(&root_path).with_context(|| {
+                format!("cannot resolve file store root {}", root_path.display())
+            })?;
+            let root = Dir::open_ambient_dir(&root_path, ambient_authority())
+                .with_context(|| format!("cannot open file store root {}", root_path.display()))?;
+            let relative = canonical_relative_target(&root_path, &key)
+                .with_context(|| format!("cannot resolve file {key}"))?;
+            before_open();
+            let mut file = root
+                .open(&relative)
+                .with_context(|| format!("cannot read {key}"))?;
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)
+                .with_context(|| format!("cannot read {key}"))?;
+            Ok(bytes)
+        })
+        .await
+        .context("file-store read task failed")?
     }
-
-    async fn path(&self, key: &str, create_parent: bool) -> Result<PathBuf> {
-        validate_key(key)?;
-        tokio::fs::create_dir_all(&self.root).await?;
-        let root = tokio::fs::canonicalize(&self.root).await?;
-        let path = root.join(key);
-        let parent = path.parent().context("file key has no parent")?;
-        if create_parent {
-            create_parent_directories(&root, key).await?;
-        }
-        let canonical_parent = match tokio::fs::canonicalize(parent).await {
-            Ok(parent) => parent,
-            Err(error) if !create_parent && error.kind() == std::io::ErrorKind::NotFound => {
-                let mut ancestor = parent;
-                let canonical_ancestor = loop {
-                    match tokio::fs::canonicalize(ancestor).await {
-                        Ok(canonical) => break canonical,
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                            ancestor = ancestor
-                                .parent()
-                                .context("file key parent is outside the store")?;
-                        }
-                        Err(error) => return Err(error.into()),
-                    }
-                };
-                if !canonical_ancestor.starts_with(&root) {
-                    bail!("file key escapes the configured store root: {key:?}");
-                }
-                let missing = parent
-                    .strip_prefix(ancestor)
-                    .context("file key parent is outside the store")?;
-                return Ok(canonical_ancestor
-                    .join(missing)
-                    .join(path.file_name().context("file key has no name")?));
-            }
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("cannot resolve parent of {}", path.display()));
-            }
-        };
-        if !canonical_parent.starts_with(&root) {
-            bail!("file key escapes the configured store root: {key:?}");
-        }
-        Ok(canonical_parent.join(path.file_name().context("file key has no name")?))
-    }
-}
-
-async fn create_parent_directories(root: &Path, key: &str) -> Result<()> {
-    let mut directory = root.to_path_buf();
-    let mut segments = key.split('/').peekable();
-    while let Some(segment) = segments.next() {
-        if segments.peek().is_none() {
-            break;
-        }
-        let candidate = directory.join(segment);
-        match tokio::fs::create_dir(&candidate).await {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("cannot create {}", candidate.display()));
-            }
-        }
-        directory = tokio::fs::canonicalize(&candidate)
-            .await
-            .with_context(|| format!("cannot resolve {}", candidate.display()))?;
-        if !directory.starts_with(root) {
-            bail!("file key escapes the configured store root: {key:?}");
-        }
-    }
-    Ok(())
 }
 
 #[async_trait]
 impl FileStore for FsFileStore {
     async fn put(&self, key: &str, bytes: &[u8], media_type: Option<&str>) -> Result<FileMetadata> {
-        let path = self.path(key, true).await?;
-        let parent = path.parent().context("file key has no parent")?;
-        let staging = parent.join(format!(".{}.tmp", uuid::Uuid::new_v4()));
-        tokio::fs::write(&staging, bytes)
+        validate_key(key)?;
+        tokio::fs::create_dir_all(&self.root)
             .await
-            .with_context(|| format!("cannot write {}", staging.display()))?;
-        if let Err(error) = tokio::fs::rename(&staging, &path).await {
-            let _ = tokio::fs::remove_file(&staging).await;
-            return Err(error).with_context(|| format!("cannot save {}", path.display()));
-        }
-        Ok(FileMetadata {
-            size_bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
-            media_type: media_type
-                .map(str::to_owned)
-                .or_else(|| crate::media_type_for(Path::new(key)).map(str::to_owned)),
+            .with_context(|| format!("cannot create file store root {}", self.root.display()))?;
+        let root_path = self.root.clone();
+        let key = key.to_owned();
+        let bytes = bytes.to_vec();
+        let media_type = media_type.map(str::to_owned);
+        tokio::task::spawn_blocking(move || -> Result<FileMetadata> {
+            use cap_std::ambient_authority;
+            use cap_std::fs::Dir;
+            use std::io::Write;
+
+            let root_path = std::fs::canonicalize(&root_path).with_context(|| {
+                format!("cannot resolve file store root {}", root_path.display())
+            })?;
+            let root = Dir::open_ambient_dir(&root_path, ambient_authority())
+                .with_context(|| format!("cannot open file store root {}", root_path.display()))?;
+            let relative = Path::new(&key);
+            let parent = relative
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            let directory = create_parent_directory(&root, &root_path, parent)
+                .with_context(|| format!("cannot open parent directory for {key}"))?;
+            let file_name = relative.file_name().context("file key has no name")?;
+            let staging = format!(".{}.tmp", uuid::Uuid::new_v4());
+            write_staging_file(&directory, &staging, |file| file.write_all(&bytes))
+                .with_context(|| format!("cannot write staging file for {key}"))?;
+            if let Err(error) = directory.rename(&staging, &directory, file_name) {
+                let _ = directory.remove_file(&staging);
+                return Err(error).with_context(|| format!("cannot save {key}"));
+            }
+            Ok(FileMetadata {
+                size_bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+                media_type: media_type
+                    .or_else(|| crate::media_type_for(Path::new(&key)).map(str::to_owned)),
+            })
         })
+        .await
+        .context("file-store write task failed")?
     }
 
     async fn read(&self, key: &str) -> Result<Vec<u8>> {
-        let path = self.path(key, false).await?;
-        if let Ok(canonical) = tokio::fs::canonicalize(&path).await {
-            let root = tokio::fs::canonicalize(&self.root).await?;
-            if !canonical.starts_with(root) {
-                bail!("file key escapes the configured store root: {key:?}");
-            }
-        }
-        tokio::fs::read(&path)
-            .await
-            .with_context(|| format!("cannot read {}", path.display()))
+        self.read_with_hook(key, || {}).await
     }
 
     async fn metadata(&self, key: &str) -> Result<Option<FileMetadata>> {
-        let path = self.path(key, false).await?;
-        if let Ok(canonical) = tokio::fs::canonicalize(&path).await {
-            let root = tokio::fs::canonicalize(&self.root).await?;
-            if !canonical.starts_with(root) {
-                bail!("file key escapes the configured store root: {key:?}");
+        validate_key(key)?;
+        let root_path = self.root.clone();
+        let key = key.to_owned();
+        tokio::task::spawn_blocking(move || -> Result<Option<FileMetadata>> {
+            use cap_std::ambient_authority;
+            use cap_std::fs::Dir;
+
+            let root_path = std::fs::canonicalize(&root_path).with_context(|| {
+                format!("cannot resolve file store root {}", root_path.display())
+            })?;
+            let root = Dir::open_ambient_dir(&root_path, ambient_authority())
+                .with_context(|| format!("cannot open file store root {}", root_path.display()))?;
+            let relative = match canonical_relative_target(&root_path, &key) {
+                Ok(relative) => relative,
+                Err(error)
+                    if error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+                {
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
+            };
+            match root.metadata(&relative) {
+                Ok(metadata) if metadata.is_file() => Ok(Some(FileMetadata {
+                    size_bytes: metadata.len(),
+                    media_type: crate::media_type_for(Path::new(&key)).map(str::to_owned),
+                })),
+                Ok(_) => Ok(None),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(error).with_context(|| format!("cannot inspect {key}")),
             }
-        }
-        match tokio::fs::metadata(&path).await {
-            Ok(metadata) if metadata.is_file() => Ok(Some(FileMetadata {
-                size_bytes: metadata.len(),
-                media_type: crate::media_type_for(&path).map(str::to_owned),
-            })),
-            Ok(_) => Ok(None),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error).with_context(|| format!("cannot inspect {}", path.display())),
-        }
+        })
+        .await
+        .context("file-store metadata task failed")?
     }
 
     async fn delete_prefix(&self, prefix: &str) -> Result<()> {
         validate_prefix(prefix)?;
-        let path = self.path(prefix.trim_end_matches('/'), false).await?;
-        if let Ok(canonical) = tokio::fs::canonicalize(&path).await {
-            let root = tokio::fs::canonicalize(&self.root).await?;
-            if !canonical.starts_with(root) {
-                bail!("file key prefix escapes the configured store root: {prefix:?}");
+        let root_path = self.root.clone();
+        let relative = prefix.trim_end_matches('/').to_owned();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            use cap_std::ambient_authority;
+            use cap_std::fs::Dir;
+
+            let root_path = match std::fs::canonicalize(&root_path) {
+                Ok(path) => path,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => return Err(error.into()),
+            };
+            let root = Dir::open_ambient_dir(&root_path, ambient_authority())
+                .with_context(|| format!("cannot open file store root {}", root_path.display()))?;
+            if let Err(error) = canonical_relative_target(&root_path, &relative) {
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                {
+                    return Ok(());
+                }
+                return Err(error);
             }
-        }
-        match tokio::fs::remove_dir_all(&path).await {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error).with_context(|| format!("cannot remove {}", path.display())),
+            match root.remove_dir_all(&relative) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error).with_context(|| format!("cannot remove {relative}")),
+            }
+        })
+        .await
+        .context("file-store deletion task failed")?
+    }
+}
+
+fn canonical_relative_target(root_path: &Path, key: &str) -> Result<PathBuf> {
+    let target = std::fs::canonicalize(root_path.join(key))
+        .with_context(|| format!("cannot resolve file {key}"))?;
+    if !target.starts_with(root_path) {
+        bail!("file key escapes the configured store root: {key:?}");
+    }
+    target
+        .strip_prefix(root_path)
+        .map(Path::to_path_buf)
+        .context("resolved file is outside the configured store root")
+}
+
+fn create_parent_directory(
+    root: &cap_std::fs::Dir,
+    root_path: &Path,
+    parent: &Path,
+) -> Result<cap_std::fs::Dir> {
+    let mut directory = root.open_dir(".")?;
+    let mut resolved = PathBuf::new();
+    for component in parent.components() {
+        let Component::Normal(segment) = component else {
+            continue;
+        };
+        match std::fs::canonicalize(root_path.join(&resolved).join(segment)) {
+            Ok(canonical) => {
+                if !canonical.starts_with(root_path) {
+                    bail!(
+                        "file key escapes the configured store root: {}",
+                        parent.display()
+                    );
+                }
+                resolved = canonical
+                    .strip_prefix(root_path)
+                    .context("resolved parent is outside the configured store root")?
+                    .to_path_buf();
+                directory = root.open_dir(&resolved)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match directory.create_dir(segment) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(error.into()),
+                }
+                directory = directory.open_dir(segment)?;
+                resolved.push(segment);
+            }
+            Err(error) => return Err(error.into()),
         }
     }
+    Ok(directory)
+}
+
+fn write_staging_file<F>(directory: &cap_std::fs::Dir, staging: &str, write_body: F) -> Result<()>
+where
+    F: FnOnce(&mut cap_std::fs::File) -> std::io::Result<()>,
+{
+    use cap_std::fs::OpenOptions;
+
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    let mut file = directory.open_with(staging, &options)?;
+    if let Err(error) = write_body(&mut file) {
+        drop(file);
+        let _ = directory.remove_file(staging);
+        return Err(error).with_context(|| format!("cannot write staging file {staging}"));
+    }
+    if let Err(error) = file.sync_all() {
+        drop(file);
+        let _ = directory.remove_file(staging);
+        return Err(error).with_context(|| format!("cannot sync staging file {staging}"));
+    }
+    Ok(())
 }
 
 fn validate_key(key: &str) -> Result<()> {

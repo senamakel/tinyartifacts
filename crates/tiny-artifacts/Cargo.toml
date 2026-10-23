@@ -19,6 +19,7 @@ thiserror.workspace = true
 anyhow.workspace = true
 uuid.workspace = true
 tokio.workspace = true
+cap-std.workspace = true
 tracing.workspace = true
 tinytools.workspace = true
 tinystoragedrivers-types.workspace = true
