@@ -331,6 +331,21 @@ async fn metadata_treats_a_missing_root_as_an_absent_file() {
 }
 
 #[tokio::test]
+async fn filesystem_operations_report_a_root_nested_under_a_file() {
+    let base = temp_dir();
+    let parent = base.join("file");
+    std::fs::write(&parent, b"not a directory").unwrap();
+    let root = parent.join("store");
+    let store = FsFileStore::new(&root);
+
+    assert!(store.read("missing.txt").await.is_err());
+    assert!(store.metadata("missing.txt").await.is_err());
+    assert!(store.delete_prefix("artifacts/").await.is_err());
+    assert!(store.put("file.txt", b"bytes", None).await.is_err());
+    assert_eq!(std::fs::read(parent).unwrap(), b"not a directory");
+}
+
+#[tokio::test]
 async fn metadata_treats_a_directory_target_as_absent() {
     let root = temp_dir();
     std::fs::create_dir(root.join("directory")).unwrap();
@@ -394,6 +409,18 @@ async fn delete_prefix_through_an_in_root_symlink_removes_the_target_contents() 
         .unwrap();
 
     assert!(!target.join("artifact.bin").exists());
+}
+
+#[tokio::test]
+async fn delete_prefix_reports_a_file_instead_of_a_directory() {
+    let root = temp_dir();
+    std::fs::write(root.join("file"), b"keep").unwrap();
+
+    assert!(FsFileStore::new(&root)
+        .delete_prefix("file/")
+        .await
+        .is_err());
+    assert_eq!(std::fs::read(root.join("file")).unwrap(), b"keep");
 }
 
 #[tokio::test]
