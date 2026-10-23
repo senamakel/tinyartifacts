@@ -355,15 +355,19 @@ impl FileStore for FsFileStore {
                 Ok(relative) => relative,
                 Err(error)
                     if error
-                    .downcast_ref::<std::io::Error>()
-                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
-                => return Ok(()),
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+                {
+                    return Ok(())
+                }
                 Err(error) => return Err(error),
             };
             match root.remove_dir_all(&relative) {
                 Ok(()) => Ok(()),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(error) => Err(error).with_context(|| format!("cannot remove {relative}")),
+                Err(error) => {
+                    Err(error).with_context(|| format!("cannot remove {}", relative.display()))
+                }
             }
         })
         .await

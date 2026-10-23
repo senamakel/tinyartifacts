@@ -14,10 +14,15 @@ fn a_failed_staging_write_removes_its_partial_file() {
 
     let root = temp_dir();
     let directory = Dir::open_ambient_dir(&root, ambient_authority()).unwrap();
-    let result = write_staging_file(&directory, ".partial.tmp", |file| {
-        file.write_all(b"partial")?;
-        Err(std::io::Error::other("injected write failure"))
-    }, |file| file.sync_all());
+    let result = write_staging_file(
+        &directory,
+        ".partial.tmp",
+        |file| {
+            file.write_all(b"partial")?;
+            Err(std::io::Error::other("injected write failure"))
+        },
+        |file| file.sync_all(),
+    );
 
     assert!(result.is_err());
     assert!(!root.join(".partial.tmp").exists());
@@ -326,15 +331,28 @@ async fn metadata_treats_a_missing_root_as_an_absent_file() {
 }
 
 #[tokio::test]
+async fn metadata_treats_a_directory_target_as_absent() {
+    let root = temp_dir();
+    std::fs::create_dir(root.join("directory")).unwrap();
+
+    assert_eq!(
+        FsFileStore::new(&root).metadata("directory").await.unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
 async fn put_cleans_up_when_the_target_is_a_directory() {
     let root = temp_dir();
     std::fs::create_dir(root.join("directory")).unwrap();
     let store = FsFileStore::new(&root);
 
     assert!(store.put("directory", b"bytes", None).await.is_err());
-    assert!(std::fs::read_dir(&root)
+    assert!(std::fs::read_dir(&root).unwrap().all(|entry| !entry
         .unwrap()
-        .all(|entry| !entry.unwrap().file_name().to_string_lossy().ends_with(".tmp")));
+        .file_name()
+        .to_string_lossy()
+        .ends_with(".tmp")));
 }
 
 #[tokio::test]
