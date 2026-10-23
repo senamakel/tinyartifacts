@@ -1,13 +1,12 @@
-//! Durable bytes behind [`FileRef`] keys.
+//! Durable artifact bytes over a host-bound blob handle.
 
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
-use tinystoragedrivers_core::{BlobStore as TsdBlobStore, ScopedStorage};
+use tinystoragedrivers_api::{BlobStore as TsdBlobStore, Storage};
 use tokio::io::AsyncWriteExt;
 
-use crate::file_ref::{FileRef, FileRoots};
 /// Storage-independent metadata returned when bytes are written.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileMetadata {
@@ -23,39 +22,36 @@ pub trait FileStore: Send + Sync {
     /// Store bytes at `key`, replacing any existing object.
     ///
     /// # Errors
-    ///
     /// Returns an error when the key is invalid or storage fails.
     async fn put(&self, key: &str, bytes: &[u8], media_type: Option<&str>) -> Result<FileMetadata>;
     /// Read the complete object at `key`.
     ///
     /// # Errors
-    ///
     /// Returns an error when the key is invalid, the object is missing, or
     /// storage fails.
     async fn read(&self, key: &str) -> Result<Vec<u8>>;
     /// Return metadata for `key`, or `None` when it does not exist.
     ///
     /// # Errors
-    ///
     /// Returns an error when the key is invalid or storage fails.
     async fn metadata(&self, key: &str) -> Result<Option<FileMetadata>>;
     /// Remove every object below the directory `prefix`, which must end in `/`.
     ///
     /// # Errors
-    ///
     /// Returns an error when the prefix is invalid or storage fails.
     async fn delete_prefix(&self, prefix: &str) -> Result<()>;
 }
 
-/// [`FileStore`] adapter for a host-provided scoped storage handle.
+/// [`FileStore`] adapter for a host-provided blob handle.
 pub struct BlobFileStore {
     blobs: std::sync::Arc<dyn TsdBlobStore>,
 }
 
 impl BlobFileStore {
-    /// Adapt the blobs in `storage` to the artifact file-store port.
+    /// Adapt the blobs in the host-bound `storage` bundle to the artifact
+    /// file-store port.
     #[must_use]
-    pub fn new(storage: &ScopedStorage) -> Self {
+    pub fn new(storage: &Storage) -> Self {
         Self {
             blobs: storage.blobs().clone(),
         }
@@ -373,35 +369,6 @@ fn validate_prefix(prefix: &str) -> Result<()> {
         bail!("file key directory prefix must end with `/`: {prefix:?}");
     }
     validate_key(&prefix[..prefix.len() - 1])
-}
-
-/// Copy a legacy path-based reference into any configured file store.
-///
-/// The source path is resolved against the supplied roots before it is read;
-/// this also applies the host's guard to desktop data being imported.
-///
-/// # Errors
-///
-/// Returns an error if the old path is refused, unreadable, or the new object
-/// cannot be written.
-pub async fn import_legacy_file(
-    store: &dyn FileStore,
-    roots: &FileRoots,
-    legacy: &FileRef,
-    key: &str,
-) -> Result<FileRef> {
-    let source = roots.resolve(&legacy.key).await?;
-    let bytes = tokio::fs::read(&source.path).await?;
-    let media_type = legacy
-        .media_type
-        .as_deref()
-        .or(source.media_type.as_deref());
-    let metadata = store.put(key, &bytes, media_type).await?;
-    Ok(FileRef {
-        key: key.to_owned(),
-        size_bytes: metadata.size_bytes,
-        media_type: metadata.media_type,
-    })
 }
 
 #[cfg(test)]

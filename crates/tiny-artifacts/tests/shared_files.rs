@@ -9,7 +9,9 @@ use tiny_artifacts::{
     ArtifactKind, ArtifactPublisher, ArtifactRecord, ArtifactStore, ArtifactVersion, Artifacts,
     Author, BlobFileStore, Content, FileRoots, FileStore, PublishOptions, PublishedLink,
 };
-use tinystoragedrivers_core::{BlobStore, MemoryStorage, Scope, StorageBackend};
+use tinystoragedrivers_api::{BlobStore, StorageBackend};
+use tinystoragedrivers_testkit::memory_backend;
+use tinystoragedrivers_types::Scope;
 
 #[derive(Clone, Default)]
 struct Records(Arc<Mutex<HashMap<String, ArtifactRecord>>>);
@@ -75,8 +77,9 @@ async fn separate_services_read_share_and_delete_shared_file_versions() {
     let input = temp_dir();
     std::fs::write(input.join("report.pdf"), b"version one").unwrap();
     let records = Records::default();
-    let backend = MemoryStorage::new();
-    let first_storage = backend.for_scope(&Scope::local()).unwrap();
+    let backend = memory_backend();
+    let scope = Scope::new("artifact-shared-files").unwrap();
+    let first_storage = backend.for_scope(&scope).unwrap();
     let first_blobs = first_storage.blobs().clone();
     let first_files = Arc::new(BlobFileStore::new(&first_storage));
     let first = Artifacts::new(Arc::new(records.clone()))
@@ -120,7 +123,7 @@ async fn separate_services_read_share_and_delete_shared_file_versions() {
         .unwrap();
     std::fs::remove_dir_all(&input).unwrap();
 
-    let second_storage = backend.for_scope(&Scope::local()).unwrap();
+    let second_storage = backend.for_scope(&scope).unwrap();
     let second_blobs = second_storage.blobs().clone();
     let second_files = Arc::new(BlobFileStore::new(&second_storage));
     let second = Artifacts::new(Arc::new(records.clone()))
@@ -139,9 +142,12 @@ async fn separate_services_read_share_and_delete_shared_file_versions() {
     );
 
     assert!(second.delete(&id).await.unwrap().0);
-    assert!(first_blobs
-        .list("artifacts/files/shared-report/")
-        .await
-        .unwrap()
-        .is_empty());
+    assert_eq!(
+        first_blobs
+            .list("artifacts/files/shared-report/")
+            .await
+            .unwrap()
+            .len(),
+        0
+    );
 }

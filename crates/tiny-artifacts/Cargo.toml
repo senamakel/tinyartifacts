@@ -21,7 +21,9 @@ uuid.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tinytools.workspace = true
-tinystoragedrivers-core.workspace = true
+tinystoragedrivers-types.workspace = true
+tinystoragedrivers-api.workspace = true
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tinystoragedrivers-testkit.workspace = true

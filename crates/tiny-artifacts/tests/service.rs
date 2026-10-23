@@ -13,10 +13,12 @@ use serde_json::json;
 use tiny_artifacts::{
     ArtifactAuthor, ArtifactEvent, ArtifactEventKind, ArtifactKind, ArtifactObserver,
     ArtifactPublisher, ArtifactRecord, ArtifactStatus, ArtifactStore, ArtifactVersion, Artifacts,
-    ArtifactsError, Author, Content, CreateArtifactTool, DeleteArtifactTool, FileRefError,
-    FileRoots, FileStore, FsFileStore, PublishOptions, PublishedLink, ShareArtifactTool,
+    ArtifactsError, Author, BlobFileStore, Content, CreateArtifactTool, DeleteArtifactTool,
+    FileRefError, FileRoots, FileStore, PublishOptions, PublishedLink, ShareArtifactTool,
     UpdateArtifactTool,
 };
+use tinystoragedrivers_testkit::memory_storage;
+use tinystoragedrivers_types::Scope;
 use tinytools::Tool;
 
 #[derive(Default)]
@@ -100,12 +102,17 @@ fn workdir() -> PathBuf {
     dir
 }
 
+fn blob_file_store() -> Arc<BlobFileStore> {
+    let storage = memory_storage(&Scope::new("artifact-service-test").unwrap());
+    Arc::new(BlobFileStore::new(&storage))
+}
+
 fn service(root: &Path) -> (Arc<Artifacts>, Arc<Recorder>) {
     let recorder = Arc::new(Recorder::default());
     let artifacts = Artifacts::new(Arc::new(MemStore::default()))
         .with_observer(recorder.clone())
         .with_file_roots(FileRoots::new([root.to_path_buf()]))
-        .with_file_store(Arc::new(FsFileStore::new(workdir())));
+        .with_file_store(blob_file_store());
     (Arc::new(artifacts), recorder)
 }
 
@@ -293,7 +300,7 @@ async fn a_slow_producer_opens_pending_then_completes_or_fails() {
         .unwrap();
     assert_eq!(opened.record.status, ArtifactStatus::Pending);
     assert_eq!(opened.version, 0);
-    assert!(opened.record.versions.is_empty());
+    assert_eq!(opened.record.versions.len(), 0);
 
     let done = artifacts
         .revise(
@@ -466,7 +473,7 @@ async fn an_older_file_version_remains_shareable_after_its_source_changes() {
     let artifacts = Artifacts::new(Arc::new(MemStore::default()))
         .with_publisher(Arc::new(FakePublisher::default()))
         .with_file_roots(FileRoots::new([root.clone()]))
-        .with_file_store(Arc::new(FsFileStore::new(workdir())));
+        .with_file_store(blob_file_store());
     let id = artifacts
         .create(
             ArtifactKind::File,
@@ -672,12 +679,12 @@ fn the_service_debug_view_shows_its_wiring_not_its_contents() {
 #[tokio::test]
 async fn the_file_store_keeps_each_version_after_the_source_changes() {
     let root = workdir();
-    let kept = workdir();
+    let file_store = blob_file_store();
     std::fs::write(root.join("deck.pptx"), b"v1").unwrap();
     let artifacts = Artifacts::new(Arc::new(MemStore::default()))
         .with_publisher(Arc::new(FakePublisher::default()))
         .with_file_roots(FileRoots::new([root.clone()]))
-        .with_version_files(&kept);
+        .with_file_store(file_store.clone());
     let id = artifacts
         .create(
             ArtifactKind::File,
@@ -704,7 +711,6 @@ async fn the_file_store_keeps_each_version_after_the_source_changes() {
         .record;
 
     let file_of = |n: u32| record.version(n).unwrap().file.clone().unwrap();
-    let file_store = FsFileStore::new(&kept);
     assert_eq!(file_store.read(&file_of(1).key).await.unwrap(), b"v1");
     assert_eq!(
         file_store.read(&file_of(2).key).await.unwrap(),
@@ -727,11 +733,11 @@ async fn the_file_store_keeps_each_version_after_the_source_changes() {
 #[tokio::test]
 async fn deleting_an_artifact_removes_its_version_files() {
     let root = workdir();
-    let kept = workdir();
+    let file_store = blob_file_store();
     std::fs::write(root.join("notes"), b"plain").unwrap();
     let artifacts = Artifacts::new(Arc::new(MemStore::default()))
         .with_file_roots(FileRoots::new([root.clone()]))
-        .with_version_files(&kept);
+        .with_file_store(file_store.clone());
     let saved = artifacts
         .create(
             ArtifactKind::File,
@@ -742,17 +748,20 @@ async fn deleting_an_artifact_removes_its_version_files() {
         )
         .await
         .unwrap();
-    let id = saved.record.id;
-    // No extension: the copy is just the version number.
-    assert!(kept
-        .join("artifacts")
-        .join("files")
-        .join(&id)
-        .join("v1")
-        .is_file());
+    let key = saved
+        .record
+        .latest()
+        .unwrap()
+        .file
+        .as_ref()
+        .unwrap()
+        .key
+        .clone();
+    let id = saved.record.id.clone();
+    assert!(file_store.metadata(&key).await.unwrap().is_some());
 
     assert!(artifacts.delete(&id).await.unwrap().0);
-    assert!(!kept.join("artifacts").join("files").join(&id).exists());
+    assert!(file_store.metadata(&key).await.unwrap().is_none());
     // Deleting again finds nothing and touches nothing.
     assert!(!artifacts.delete(&id).await.unwrap().0);
 }
@@ -760,11 +769,10 @@ async fn deleting_an_artifact_removes_its_version_files() {
 #[tokio::test]
 async fn a_version_file_needs_an_id_that_is_a_single_file_name() {
     let root = workdir();
-    let kept = workdir();
     std::fs::write(root.join("a.txt"), b"x").unwrap();
     let artifacts = Artifacts::new(Arc::new(MemStore::default()))
         .with_file_roots(FileRoots::new([root.clone()]))
-        .with_version_files(&kept);
+        .with_file_store(blob_file_store());
     let err = artifacts
         .create(
             ArtifactKind::File,
@@ -776,13 +784,13 @@ async fn a_version_file_needs_an_id_that_is_a_single_file_name() {
         .await
         .unwrap_err();
     assert!(matches!(err, ArtifactsError::Backend(_)), "{err}");
-    assert!(!kept.parent().unwrap().join("escape").exists());
 }
 
 #[tokio::test]
 async fn text_versions_are_not_copied() {
-    let kept = workdir();
-    let artifacts = Artifacts::new(Arc::new(MemStore::default())).with_version_files(&kept);
+    let file_store = blob_file_store();
+    let artifacts =
+        Artifacts::new(Arc::new(MemStore::default())).with_file_store(file_store.clone());
     let saved = artifacts
         .create(
             ArtifactKind::Markdown,
@@ -794,7 +802,11 @@ async fn text_versions_are_not_copied() {
         .await
         .unwrap();
     assert!(saved.record.latest().unwrap().file.is_none());
-    assert!(!kept.join(&saved.record.id).exists());
+    assert!(file_store
+        .metadata(&format!("artifacts/files/{}/v1", saved.record.id))
+        .await
+        .unwrap()
+        .is_none());
     let shown = format!("{artifacts:?}");
     assert!(shown.contains("file_store: true"), "{shown}");
 }

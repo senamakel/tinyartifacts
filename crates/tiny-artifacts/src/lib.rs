@@ -12,8 +12,8 @@
 //! ([`registered_tools`]) and the host's own producers both go through it. The
 //! host supplies the ports:
 //!
-//! * [`ArtifactStore`] — where records are kept ([`FsArtifactStore`] is a
-//!   ready-made one: a JSON file per artifact in a directory);
+//! * [`ArtifactStore`] — where records are kept (`DocumentArtifactStore` adapts
+//!   the host-bound document port);
 //! * [`ArtifactObserver`] — told after every write, to show the artifact
 //!   (a card, a board row) and place its file where the user can open it;
 //! * [`ArtifactPublisher`] — how a version is shared, when the host can;
@@ -22,24 +22,30 @@
 //! ```rust,no_run
 //! use std::sync::Arc;
 //! use tiny_artifacts::{
-//!     registered_tools, ArtifactStore, Artifacts, Author, FileRoots, FsFileStore,
+//!     registered_tools, ArtifactStore, Artifacts, Author, BlobFileStore, DocumentArtifactStore,
+//!     FileRoots,
 //! };
 //!
-//! fn tools(store: Arc<dyn ArtifactStore>, workdir: std::path::PathBuf) {
+//! async fn tools(
+//!     storage: &tinystoragedrivers_api::Storage,
+//!     workdir: std::path::PathBuf,
+//! ) -> anyhow::Result<()> {
+//!     let store = DocumentArtifactStore::open(storage).await?;
 //!     let artifacts = Arc::new(
-//!         Artifacts::new(store)
+//!         Artifacts::new(Arc::new(store))
 //!             .with_file_roots(FileRoots::new([workdir]))
-//!             .with_file_store(Arc::new(FsFileStore::new("data/artifact-files"))),
+//!             .with_file_store(Arc::new(BlobFileStore::new(&storage))),
 //!     );
 //!     let _tools = registered_tools(artifacts, Author::agent("my-agent"));
+//!     Ok(())
 //! }
 //! ```
 
 mod diff;
+pub mod document_store;
 pub mod events;
 pub mod file_ref;
 pub mod file_store;
-pub mod fs_store;
 pub mod publish;
 pub mod service;
 pub mod storage;
@@ -48,13 +54,13 @@ pub mod tools;
 pub mod types;
 
 pub use diff::{ArtifactDiff, DiffLine, DiffOp, MAX_DIFF_LINES};
+pub use document_store::DocumentArtifactStore;
 pub use events::{ArtifactEvent, ArtifactEventKind, ArtifactObserver};
 pub use file_ref::{media_type_for, FileRef, FileRefError, FileRoots, PathGuard, ResolvedFile};
-pub use file_store::{import_legacy_file, BlobFileStore, FileMetadata, FileStore, FsFileStore};
-pub use fs_store::FsArtifactStore;
+pub use file_store::{BlobFileStore, FileMetadata, FileStore, FsFileStore};
 pub use publish::{ArtifactPublisher, PublishOptions};
 pub use service::{Artifacts, ArtifactsError, Author, Content, Published, Saved};
-pub use storage::storage_schema;
+pub use storage::collections;
 pub use store::ArtifactStore;
 pub use tools::{
     registered_tools, CreateArtifactTool, DeleteArtifactTool, ListArtifactsTool, ReadArtifactTool,

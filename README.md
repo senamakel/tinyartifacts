@@ -32,14 +32,16 @@ All creation and change goes through one service, `Artifacts`:
 
 ```rust
 use std::sync::Arc;
+use tinystoragedrivers_api::Storage;
 use tiny_artifacts::{
-    Artifacts, ArtifactKind, Author, Content, FileRoots, FsArtifactStore, FsFileStore,
+    Artifacts, ArtifactKind, Author, BlobFileStore, Content, DocumentArtifactStore, FileRoots,
 };
 
-# async fn demo() -> Result<(), tiny_artifacts::ArtifactsError> {
-let artifacts = Artifacts::new(Arc::new(FsArtifactStore::new("data/artifacts")))
+async fn demo(storage: &Storage) -> anyhow::Result<()> {
+let store = DocumentArtifactStore::open(storage).await?;
+let artifacts = Artifacts::new(Arc::new(store))
     .with_file_roots(FileRoots::new(["/path/to/agent/workspace".into()]))
-    .with_file_store(Arc::new(FsFileStore::new("data/artifact-files")));
+    .with_file_store(Arc::new(BlobFileStore::new(storage)));
 
 // A text artifact, then a human edit of it.
 let saved = artifacts
@@ -53,7 +55,7 @@ artifacts
 artifacts
     .create(ArtifactKind::File, "Q3 deck", Content::File("decks/q3.pptx".into()), &Author::agent("writer"), None)
     .await?;
-# Ok(()) }
+Ok(()) }
 ```
 
 The service enforces the rules, whoever is calling:
@@ -78,17 +80,19 @@ The service enforces the rules, whoever is calling:
 
 | Port | Role |
 | --- | --- |
-| `ArtifactStore` | Where records are kept. `FsArtifactStore` is a ready-made one: one JSON file per artifact in a directory, written atomically. |
+| `ArtifactStore` | Where records are kept. `DocumentArtifactStore` adapts the host-bound document port and applies the artifact-owned schema migration on open. |
 | `ArtifactObserver` | Told after every write (`pending`, `ready`, `failed`, `deleted`) — show a card, copy the file where the user can open it. If it fails, the write stands and the caller gets a notice. |
 | `ArtifactPublisher` | How a version is shared (e.g. an upload and a link). Optional. |
 | `FileStore` | Durable file bytes behind `FileRef` keys. Implement it for a host's blob backend, or use `BlobFileStore` to adapt the `BlobStore` port. |
-| `FsFileStore` | Filesystem implementation of `FileStore`, useful for a single-host install or local development. |
 | `FileRoots` | Allowed input folders. Paths are canonicalized and checked before a file store reads them; `with_guard` can refuse paths inside them (credential stores, its own data). |
 
-Older records that serialized `FileRef.path` still deserialize. A host importing
-those records into any file store can use `tiny_artifacts::import_legacy_file`
-with the old allowed roots; the imported record should then be saved with the
-new key returned by that function.
+Hosts provide an already-bound `tinystoragedrivers_api::Storage` bundle. The
+library exposes `collections()` for host setup, while `DocumentArtifactStore::open`
+ensures its own collections and runs its migration before returning. A host
+that imports old filesystem records can pass each record's serialized bytes to
+`import_legacy_record_json`; locating source files and copying legacy file
+bytes remain host responsibilities. Legacy `FileRef.path` values still
+deserialize so host import code can resolve them with its existing policy.
 
 ## Agent tools
 
@@ -120,9 +124,9 @@ cargo test --all-features
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 ```
 
-The integration tests in `crates/tiny-artifacts/tests/` cover the tools, the
-service (file references, lifecycle, observer, publishing) and the file-system
-store, including records written by earlier versions.
+The integration tests in `crates/tiny-artifacts/tests/` cover the tools and
+service (file references, lifecycle, observer, publishing); storage adapter
+tests use the real in-memory storage ports from the development-only testkit.
 
 ## Releasing
 

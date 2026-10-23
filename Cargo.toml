@@ -17,11 +17,13 @@ async-trait = "0.1"
 thiserror = "2"
 anyhow = "1"
 uuid = { version = "1", features = ["v4"] }
-tokio = { version = "1", features = ["fs"] }
+tokio = { version = "1", features = ["fs", "io-util"] }
 tracing = "0.1"
-tinytools = { git = "https://github.com/tinyhumansai/tinytools.git", rev = "1ec3468f6602b69b955a0e94105ed63abb5aa98c", version = "0.6" }
-# Blob-backed file versions use the same scoped port every OpenHuman module uses.
-tinystoragedrivers-core = { version = "1.0", git = "https://github.com/tinyhumansai/tinystoragedrivers.git", rev = "be94f7568fe7650b0729be55128f48270414b9a7" }
+tinytools = { git = "https://github.com/tinyhumansai/tinytools.git", rev = "3a01641", version = "0.6" }
+# Artifact records and file bytes use the host-bound stable storage ports.
+tinystoragedrivers-types = { version = "2.1.0", git = "https://github.com/tinyhumansai/tinystoragedrivers.git", rev = "05eaada962decbab33bafa4763d2bd1a67f6b456" }
+tinystoragedrivers-api = { version = "2.1.0", git = "https://github.com/tinyhumansai/tinystoragedrivers.git", rev = "05eaada962decbab33bafa4763d2bd1a67f6b456" }
+tinystoragedrivers-testkit = { version = "2.1.0", git = "https://github.com/tinyhumansai/tinystoragedrivers.git", rev = "05eaada962decbab33bafa4763d2bd1a67f6b456" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

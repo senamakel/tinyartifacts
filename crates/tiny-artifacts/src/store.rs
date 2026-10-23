@@ -1,9 +1,4 @@
 //! The [`ArtifactStore`] port: durable storage for versioned artifacts.
-//!
-//! The trait is the contract; [`crate::FsArtifactStore`] is a ready-made
-//! backend on the local file system. A host (`OpenHuman`, `OpenCompany`) may
-//! implement it against its own storage instead; the service and the tools
-//! drive it and know nothing about where bytes land.
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -22,4 +17,21 @@ pub trait ArtifactStore: Send + Sync {
     async fn upsert(&self, artifact: &ArtifactRecord) -> Result<()>;
     /// Deletes an artifact by id; returns whether one was removed.
     async fn delete(&self, id: &str) -> Result<bool>;
+}
+
+/// Reject ids that could escape the artifact namespace or collide with path
+/// separators used by versioned file keys.
+pub(crate) fn validate_id(id: &str) -> anyhow::Result<()> {
+    use anyhow::bail;
+
+    if id.is_empty() || id == "." || id == ".." {
+        bail!("invalid artifact id {id:?}");
+    }
+    if id.contains(['/', '\\', '\0']) {
+        bail!("artifact id must not contain path separators: {id:?}");
+    }
+    if id.starts_with('.') {
+        bail!("artifact id must not start with '.': {id:?}");
+    }
+    Ok(())
 }

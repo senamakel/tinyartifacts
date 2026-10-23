@@ -22,7 +22,7 @@ fn writing_into_an_empty_version_is_total_churn_and_no_change_is_none() {
 
     let same = ArtifactDiff::between(&version(1, ""), &version(2, ""));
     assert!(same.churn.abs() < f64::EPSILON);
-    assert!(same.lines.is_empty());
+    assert_eq!(same.lines.len(), 0);
 }
 
 #[test]

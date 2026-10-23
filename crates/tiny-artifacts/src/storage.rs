@@ -1,27 +1,26 @@
-//! Tiny Storage Drivers declarations owned by this crate.
+//! Collections owned by the artifact library.
 
-use tinystoragedrivers_core::schema::{Owner, Schema, ScopeClass};
+use tinystoragedrivers_types::CollectionSpec;
 
-/// Declare the blob namespace used by [`crate::BlobFileStore`].
+/// Documents containing versioned artifact records.
+pub const ARTIFACTS_COLLECTION: &str = "artifacts.records";
+
+/// The per-owner migration checkpoint.
+pub(crate) const MIGRATIONS_COLLECTION: &str = "artifacts.migrations";
+pub(crate) const MIGRATIONS_ID: &str = "schema";
+pub(crate) const SCHEMA_VERSION: u32 = 1;
+
+/// Return the document collections the host should ensure in its bound scope.
 ///
-/// Hosts compose this with their other storage schemas so the driver can
-/// reserve the `artifacts/files/` prefix in the same scope used for artifact
-/// data.
-///
-/// # Panics
-///
-/// This panics only if the hard-coded owner name ceases to be valid.
+/// Migration behavior remains owned by [`crate::DocumentArtifactStore::open`].
 #[must_use]
-#[expect(
-    clippy::expect_used,
-    reason = "the constant owner name is valid and this declaration is tested"
-)]
-pub fn storage_schema() -> Schema {
-    Schema::new(Owner::new("artifacts").expect("`artifacts` is a valid owner"))
-        .blobs("artifacts/files/", ScopeClass::Tenant)
+pub fn collections() -> Vec<CollectionSpec> {
+    vec![
+        CollectionSpec::new(ARTIFACTS_COLLECTION),
+        CollectionSpec::new(MIGRATIONS_COLLECTION),
+    ]
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 #[path = "storage_tests.rs"]
 mod tests;

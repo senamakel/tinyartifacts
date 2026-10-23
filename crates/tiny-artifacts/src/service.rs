@@ -12,7 +12,6 @@
 //!   record is always written first and anything the host shows is derived
 //!   from it.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use uuid::Uuid;
@@ -198,16 +197,6 @@ impl Artifacts {
     #[must_use]
     pub fn with_file_store(mut self, file_store: Arc<dyn FileStore>) -> Self {
         self.file_store = Some(file_store);
-        self
-    }
-
-    /// Configure the built-in filesystem file store rooted at `dir`.
-    ///
-    /// Prefer [`Self::with_file_store`] when the host already has a durable
-    /// shared blob backend.
-    #[must_use]
-    pub fn with_version_files(mut self, dir: impl Into<PathBuf>) -> Self {
-        self.file_store = Some(Arc::new(crate::FsFileStore::new(dir)));
         self
     }
 
@@ -450,7 +439,7 @@ impl Artifacts {
             };
         };
         let id = record.id.clone();
-        crate::fs_store::validate_id(&id)?;
+        crate::store::validate_id(&id)?;
         let holds_file = record.kind.holds_file();
         let Some(version) = record.versions.last_mut() else {
             return Ok(());
@@ -492,7 +481,7 @@ impl Artifacts {
         let Some(file_store) = &self.file_store else {
             return;
         };
-        if crate::fs_store::validate_id(id).is_err() {
+        if crate::store::validate_id(id).is_err() {
             return;
         }
         match file_store
