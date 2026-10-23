@@ -19,6 +19,7 @@ async fn blob_adapter_reads_metadata_and_deletes_only_the_requested_prefix() {
     let storage = storage();
     let first = BlobFileStore::new(&storage);
     let second = BlobFileStore::new(&storage);
+    assert!(format!("{first:?}").contains("BlobFileStore"));
     let metadata = first
         .put("artifacts/files/a/v1.png", b"png bytes", None)
         .await
@@ -172,6 +173,96 @@ async fn overwrite_existing_obeys_filesystem_write_permissions() {
     } else {
         assert!(result.is_err());
         assert_eq!(std::fs::read(&path).unwrap(), b"preserve");
+    }
+}
+
+#[tokio::test]
+async fn filesystem_store_round_trips_and_deletes_only_the_requested_prefix() {
+    let root = temp_dir().join("not-created-yet");
+    let store = FsFileStore::new(&root);
+    assert_eq!(store.root(), root);
+
+    let metadata = store
+        .put(
+            "artifacts/files/a/v1.txt",
+            b"first version",
+            Some("text/custom"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(metadata.size_bytes, 13);
+    assert_eq!(metadata.media_type.as_deref(), Some("text/custom"));
+    assert_eq!(
+        store.read("artifacts/files/a/v1.txt").await.unwrap(),
+        b"first version"
+    );
+    assert_eq!(
+        store.metadata("artifacts/files/a/v1.txt").await.unwrap(),
+        Some(FileMetadata {
+            size_bytes: 13,
+            media_type: Some("text/plain".to_owned()),
+        })
+    );
+
+    store
+        .put("artifacts/files/ab/v1.txt", b"sibling", None)
+        .await
+        .unwrap();
+    store.delete_prefix("artifacts/files/a/").await.unwrap();
+
+    assert!(store.read("artifacts/files/a/v1.txt").await.is_err());
+    assert_eq!(
+        store.metadata("artifacts/files/a/v1.txt").await.unwrap(),
+        None
+    );
+    assert_eq!(
+        store.read("artifacts/files/ab/v1.txt").await.unwrap(),
+        b"sibling"
+    );
+    store
+        .delete_prefix("artifacts/files/missing/")
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn filesystem_store_rejects_invalid_paths_and_escaping_symlinks() {
+    let root = temp_dir();
+    let store = FsFileStore::new(&root);
+    for key in [
+        "",
+        "../outside",
+        "nested//file",
+        "nested/./file",
+        "/absolute",
+        "bad\\key",
+    ] {
+        assert!(store.put(key, b"bad", None).await.is_err(), "{key}");
+        assert!(store.read(key).await.is_err(), "{key}");
+        assert!(store.metadata(key).await.is_err(), "{key}");
+    }
+    for prefix in ["", "nested", "nested//", "../"] {
+        assert!(store.delete_prefix(prefix).await.is_err(), "{prefix}");
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+
+        let outside = temp_dir();
+        std::fs::write(outside.join("kept.txt"), b"outside").unwrap();
+        symlink(&outside, root.join("linked-dir")).unwrap();
+        symlink(outside.join("kept.txt"), root.join("linked-file.txt")).unwrap();
+        assert!(store
+            .put("linked-dir/kept.txt", b"replace", None)
+            .await
+            .is_err());
+        assert!(store.read("linked-dir/kept.txt").await.is_err());
+        assert!(store.metadata("linked-dir/kept.txt").await.is_err());
+        assert!(store.delete_prefix("linked-dir/").await.is_err());
+        assert!(store.read("linked-file.txt").await.is_err());
+        assert!(store.metadata("linked-file.txt").await.is_err());
+        assert_eq!(std::fs::read(outside.join("kept.txt")).unwrap(), b"outside");
     }
 }
 
