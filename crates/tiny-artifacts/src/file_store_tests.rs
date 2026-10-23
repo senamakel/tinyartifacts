@@ -299,6 +299,67 @@ async fn filesystem_store_round_trips_and_deletes_only_the_requested_prefix() {
 }
 
 #[tokio::test]
+async fn metadata_treats_a_missing_root_as_an_absent_file() {
+    let root = temp_dir().join("not-created");
+    let store = FsFileStore::new(&root);
+
+    assert_eq!(store.metadata("missing.txt").await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn put_cleans_up_when_the_target_is_a_directory() {
+    let root = temp_dir();
+    std::fs::create_dir(root.join("directory")).unwrap();
+    let store = FsFileStore::new(&root);
+
+    assert!(store.put("directory", b"bytes", None).await.is_err());
+    assert!(std::fs::read_dir(&root)
+        .unwrap()
+        .all(|entry| !entry.unwrap().file_name().to_string_lossy().ends_with(".tmp")));
+}
+
+#[tokio::test]
+async fn put_rejects_a_parent_that_is_a_regular_file() {
+    let root = temp_dir();
+    std::fs::write(root.join("parent"), b"file").unwrap();
+    let store = FsFileStore::new(&root);
+
+    assert!(store.put("parent/child", b"bytes", None).await.is_err());
+    assert_eq!(std::fs::read(root.join("parent")).unwrap(), b"file");
+}
+
+#[tokio::test]
+async fn delete_prefix_treats_a_missing_root_as_empty() {
+    let root = temp_dir().join("not-created");
+
+    FsFileStore::new(&root)
+        .delete_prefix("artifacts/")
+        .await
+        .unwrap();
+
+    assert!(!root.exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn delete_prefix_through_an_in_root_symlink_removes_the_target_contents() {
+    use std::os::unix::fs::symlink;
+
+    let root = temp_dir();
+    let target = root.join("target");
+    std::fs::create_dir(&target).unwrap();
+    std::fs::write(target.join("artifact.bin"), b"bytes").unwrap();
+    symlink(&target, root.join("alias")).unwrap();
+
+    FsFileStore::new(&root)
+        .delete_prefix("alias/")
+        .await
+        .unwrap();
+
+    assert!(!target.join("artifact.bin").exists());
+}
+
+#[tokio::test]
 async fn filesystem_store_rejects_invalid_paths_and_escaping_symlinks() {
     let root = temp_dir();
     let store = FsFileStore::new(&root);
