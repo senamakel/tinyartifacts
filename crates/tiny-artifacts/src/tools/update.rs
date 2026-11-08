@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use tinytools::{PermissionLevel, Tool, ToolResult};
 
-use crate::service::{Artifacts, Author};
+use crate::service::{Artifacts, Author, Content};
 use crate::tools::{content_for, optional_str, read_required_str, saved_result, tool_error};
 
 /// Append a new revision to an existing artifact.
@@ -27,6 +27,44 @@ impl UpdateArtifactTool {
     #[must_use]
     pub fn new(artifacts: Arc<Artifacts>, author: Author) -> Self {
         Self { artifacts, author }
+    }
+
+    /// Run the tool with `content` for the new version instead of the `body`
+    /// or `path` in `args`: for a host that already holds the content (a file
+    /// read out of a sandbox) and so has no path to give. `artifact_id` and
+    /// `note` are still read from `args`, and the result is the one
+    /// [`Tool::execute`] returns.
+    ///
+    /// # Errors
+    ///
+    /// As [`Tool::execute`], for a missing `artifact_id` or a store failure.
+    pub async fn execute_with_content(
+        &self,
+        args: Value,
+        content: Content,
+    ) -> anyhow::Result<ToolResult> {
+        self.run(&args, Some(content)).await
+    }
+
+    async fn run(&self, args: &Value, content: Option<Content>) -> anyhow::Result<ToolResult> {
+        let id = read_required_str(args, "artifact_id")?;
+        let record = match self.artifacts.get(&id).await {
+            Ok(Some(record)) => record,
+            Ok(None) => return Ok(ToolResult::error(format!("artifact `{id}` not found"))),
+            Err(err) => return tool_error(err),
+        };
+        let content = match content {
+            Some(content) => content,
+            None => content_for(record.kind, args)?,
+        };
+        match self
+            .artifacts
+            .revise(&id, content, &self.author, optional_str(args, "note"))
+            .await
+        {
+            Ok(saved) => Ok(saved_result(&saved)),
+            Err(err) => tool_error(err),
+        }
     }
 }
 
@@ -74,21 +112,7 @@ impl Tool for UpdateArtifactTool {
     }
 
     async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
-        let id = read_required_str(&args, "artifact_id")?;
-        let record = match self.artifacts.get(&id).await {
-            Ok(Some(record)) => record,
-            Ok(None) => return Ok(ToolResult::error(format!("artifact `{id}` not found"))),
-            Err(err) => return tool_error(err),
-        };
-        let content = content_for(record.kind, &args)?;
-        match self
-            .artifacts
-            .revise(&id, content, &self.author, optional_str(&args, "note"))
-            .await
-        {
-            Ok(saved) => Ok(saved_result(&saved)),
-            Err(err) => tool_error(err),
-        }
+        self.run(&args, None).await
     }
 
     fn is_concurrency_safe(&self, _args: &Value) -> bool {

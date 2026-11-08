@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Add `Content::Bytes`, and `execute_with_content` on `CreateArtifactTool` and
+  `UpdateArtifactTool`, so a host that already holds a file's bytes (read out
+  of a sandbox, say) can file them as an `image` or `file` artifact without
+  writing them to disk first. This adds an enum variant: exhaustive matches on
+  `Content` need an arm for it.
 - Back artifact records with the host-bound document port and apply
   artifact-owned migrations on open.
 - Adapt file bytes through the host-bound blob port, and restore `FsFileStore`

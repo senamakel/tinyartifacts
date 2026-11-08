@@ -12,6 +12,7 @@
 //!   record is always written first and anything the host shows is derived
 //!   from it.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use uuid::Uuid;
@@ -33,6 +34,29 @@ pub enum Content {
     /// A path to a file, for `image` and `file` artifacts. Checked against the
     /// service's [`FileRoots`] before anything is written.
     File(String),
+    /// The bytes of a file the host already holds in memory, for `image` and
+    /// `file` artifacts: a file read out of a sandbox, say, that never was on
+    /// the host's disk.
+    ///
+    /// No path is involved, so [`FileRoots`] has nothing to check. The bytes
+    /// are stored through the service's [`FileStore`] exactly as a file read
+    /// from a path would be; `name` supplies only the extension (and so the
+    /// media type), never a location.
+    Bytes {
+        /// A file name or path whose extension names the file's type
+        /// (`chart.png`). Only the extension is used; one with characters
+        /// other than ASCII letters and digits is ignored.
+        name: String,
+        /// The file's content.
+        bytes: Vec<u8>,
+    },
+}
+
+/// Bytes handed to the service in place of a path, on their way to the file
+/// store.
+struct Upload {
+    name: String,
+    bytes: Vec<u8>,
 }
 
 /// Who is writing a version.
@@ -247,10 +271,10 @@ impl Artifacts {
     ) -> Result<Saved, ArtifactsError> {
         let at = crate::now_millis();
         let id = id.unwrap_or_else(new_id);
-        let version = self.version_for(kind, content, author, at).await?;
+        let (version, upload) = self.version_for(kind, content, author, at).await?;
         let mut record = ArtifactRecord::pending(id, title.trim(), kind, at);
         record.push_version(version);
-        self.keep_version_file(&mut record).await?;
+        self.keep_version_file(&mut record, upload).await?;
         record.status = ArtifactStatus::Ready;
         self.store.upsert(&record).await?;
         Ok(self.saved(record, true, ArtifactEventKind::Ready).await)
@@ -306,12 +330,12 @@ impl Artifacts {
                 }
             }
         }
-        let mut version = self
+        let (mut version, upload) = self
             .version_for(record.kind, content, author, crate::now_millis())
             .await?;
         version.note = note.filter(|n| !n.trim().is_empty());
         record.push_version(version);
-        self.keep_version_file(&mut record).await?;
+        self.keep_version_file(&mut record, upload).await?;
         record.status = ArtifactStatus::Ready;
         record.error = None;
         self.store.upsert(&record).await?;
@@ -430,7 +454,14 @@ impl Artifacts {
     }
 
     /// Persist the newest file version under a stable key and update its ref.
-    async fn keep_version_file(&self, record: &mut ArtifactRecord) -> Result<(), ArtifactsError> {
+    ///
+    /// The bytes come from `upload` when the caller supplied them, and from the
+    /// file the version's `body` names otherwise.
+    async fn keep_version_file(
+        &self,
+        record: &mut ArtifactRecord,
+        upload: Option<Upload>,
+    ) -> Result<(), ArtifactsError> {
         let Some(file_store) = &self.file_store else {
             return if record.kind.holds_file() {
                 Err(ArtifactsError::NoFileStore)
@@ -447,16 +478,35 @@ impl Artifacts {
         if !holds_file || version.file.is_some() {
             return Ok(());
         }
-        let (source, bytes) = self.files.read(&version.body).await?;
-        let name = match source.path.extension().and_then(|ext| ext.to_str()) {
+        let (extension, media_type, size_bytes, bytes) =
+            if let Some(Upload { name, bytes }) = upload {
+                let path = Path::new(&name);
+                (
+                    stored_extension(path),
+                    crate::media_type_for(path).map(str::to_owned),
+                    u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+                    bytes,
+                )
+            } else {
+                let (source, bytes) = self.files.read(&version.body).await?;
+                (
+                    source
+                        .path
+                        .extension()
+                        .and_then(|ext| ext.to_str())
+                        .map(str::to_owned),
+                    source.media_type,
+                    source.size_bytes,
+                    bytes,
+                )
+            };
+        let name = match extension {
             Some(ext) => format!("v{}.{ext}", version.version),
             None => format!("v{}", version.version),
         };
         let key = format!("artifacts/files/{id}/{name}");
-        let metadata = file_store
-            .put(&key, &bytes, source.media_type.as_deref())
-            .await?;
-        if metadata.size_bytes != source.size_bytes {
+        let metadata = file_store.put(&key, &bytes, media_type.as_deref()).await?;
+        if metadata.size_bytes != size_bytes {
             return Err(ArtifactsError::Backend(anyhow::anyhow!(
                 "file changed while artifact version {} was being stored",
                 version.version
@@ -508,30 +558,39 @@ impl Artifacts {
         content: Content,
         author: &Author,
         at: u64,
-    ) -> Result<ArtifactVersion, ArtifactsError> {
+    ) -> Result<(ArtifactVersion, Option<Upload>), ArtifactsError> {
         match (kind.holds_file(), content) {
             (false, Content::Text(text)) => {
                 if text.trim().is_empty() {
                     return Err(ArtifactsError::EmptyText);
                 }
-                Ok(ArtifactVersion::new(
-                    0,
-                    text,
-                    author.kind,
-                    author.id.clone(),
-                    at,
+                Ok((
+                    ArtifactVersion::new(0, text, author.kind, author.id.clone(), at),
+                    None,
                 ))
             }
             (true, Content::File(path)) => {
                 let file = self.files.resolve(&path).await?;
-                Ok(ArtifactVersion::new(
-                    0,
-                    file.path.to_string_lossy(),
-                    author.kind,
-                    author.id.clone(),
-                    at,
+                Ok((
+                    ArtifactVersion::new(
+                        0,
+                        file.path.to_string_lossy(),
+                        author.kind,
+                        author.id.clone(),
+                        at,
+                    ),
+                    None,
                 ))
             }
+            // The body is replaced by the storage key once the bytes are kept.
+            (true, Content::Bytes { name, bytes }) => Ok((
+                ArtifactVersion::new(0, String::new(), author.kind, author.id.clone(), at),
+                Some(Upload { name, bytes }),
+            )),
+            (false, Content::Bytes { .. }) => Err(ArtifactsError::WrongContent {
+                kind: kind.as_str(),
+                expected: "text, not file bytes",
+            }),
             (false, Content::File(_)) => Err(ArtifactsError::WrongContent {
                 kind: kind.as_str(),
                 expected: "text, not a file path",
@@ -570,6 +629,18 @@ impl Artifacts {
             .err()
             .map(|err| format!("saved, but the host could not show it: {err}"))
     }
+}
+
+/// The extension a stored file keeps, from the name a caller gave its bytes: a
+/// short run of ASCII letters and digits, so no name can put anything else in
+/// a storage key.
+fn stored_extension(name: &Path) -> Option<String> {
+    name.extension()
+        .and_then(|ext| ext.to_str())
+        .filter(|ext| {
+            !ext.is_empty() && ext.len() <= 16 && ext.chars().all(|c| c.is_ascii_alphanumeric())
+        })
+        .map(str::to_owned)
 }
 
 fn new_id() -> String {
